@@ -1,0 +1,13 @@
+diff --git a/workspace/all/common/api.c b/workspace/all/common/api.c
+index ff8767f..2ce052c 100644
+--- a/workspace/all/common/api.c
++++ b/workspace/all/common/api.c
+@@ -314,7 +314,7 @@ struct blend_args {
+ 	uint16_t *blend_line;
+ } blend_args;
+ 
+-#if __ARM_ARCH >= 5
++#if __ARM_ARCH >= 5 && !defined(__aarch64__)
+ static inline uint32_t average16(uint32_t c1, uint32_t c2) {
+ 	uint32_t ret, lowbits = 0x0821;
+ 	asm ("eor %0, %2, %3\r\n"

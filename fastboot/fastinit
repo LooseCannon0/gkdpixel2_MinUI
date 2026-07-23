@@ -1,0 +1,114 @@
+#!/bin/sh
+# ─────────────────────────────────────────────────────────────────────────────
+# fastinit — fast-boot PID 1 for MinUI on GKD Pixel 2 (replaces systemd)
+#
+# Installed as /usr/lib/systemd/systemd inside the SYSTEM squashfs; the ROCKNIX
+# initramfs switch_roots directly into this script. No systemd, no Sway, no
+# services — straight to MinUI as DRM master via SDL2's kmsdrm backend.
+#
+# Escape hatch: create a file named  rescue.txt  on the EMUELEC (FAT) partition
+# to boot the original full stock stack (systemd + Sway + wayland MinUI).
+# ─────────────────────────────────────────────────────────────────────────────
+export PATH=/usr/bin:/usr/sbin:/bin:/sbin
+
+# ── defensive mounts (initramfs normally hands these over already) ──────────
+mountpoint -q /proc || mount -t proc     proc     /proc
+mountpoint -q /sys  || mount -t sysfs    sysfs    /sys
+mountpoint -q /dev  || mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /dev/shm 2>/dev/null
+mountpoint -q /dev/pts || mount -t devpts devpts /dev/pts 2>/dev/null
+mountpoint -q /dev/shm || mount -t tmpfs  tmpfs  /dev/shm 2>/dev/null
+mountpoint -q /tmp  || mount -t tmpfs tmpfs /tmp
+mountpoint -q /run  || mount -t tmpfs tmpfs /run
+
+# ── rescue hatch: full stock boot ───────────────────────────────────────────
+if [ -f /flash/rescue.txt ]; then
+    exec /usr/lib/systemd/systemd.real
+fi
+
+# ── optional boot splash (off by default; drop splash.raw on the FAT to use) ─
+[ -f /flash/splash.raw ] && cat /flash/splash.raw > /dev/fb0 2>/dev/null
+
+# ── logging to the rw storage partition ─────────────────────────────────────
+mountpoint -q /storage || mount /dev/mmcblk0p2 /storage 2>/dev/null
+LOG=/storage/fastboot.log
+exec >> "$LOG" 2>&1
+echo "=== fastinit $(cat /proc/uptime | cut -d' ' -f1)s ==="
+
+# ── first boot: create + format the ROMS partition, install MinUI ───────────
+if [ -f /flash/first_run.txt ]; then
+    echo "first boot: creating ROMS partition"
+    modprobe exfat 2>/dev/null || insmod /usr/lib/kernel-overlays/base/lib/modules/*/kernel/fs/exfat/exfat.ko 2>/dev/null
+    sh /usr/share/first_run/install.sh
+    # install.sh reboots; if it returns, force it (this kernel has no sysrq,
+    # so use the direct reboot(2) tool; keep sysrq as a last resort)
+    sync
+    /usr/share/fastboot/pwr reboot
+    echo 1 > /proc/sys/kernel/sysrq 2>/dev/null; echo b > /proc/sysrq-trigger
+fi
+
+# ── mount the ROMS (exFAT) partition ────────────────────────────────────────
+modprobe exfat 2>/dev/null || insmod /usr/lib/kernel-overlays/base/lib/modules/*/kernel/fs/exfat/exfat.ko 2>/dev/null
+
+# ── GPU: load panfrost (udev used to do this) ───────────────────────────────
+M=$(echo /usr/lib/kernel-overlays/base/lib/modules/*)
+insmod "$M/kernel/drivers/gpu/drm/scheduler/gpu-sched.ko" 2>/dev/null
+insmod "$M/kernel/drivers/gpu/drm/panfrost/panfrost.ko" 2>/dev/null
+i=0
+while [ ! -e /dev/dri/renderD128 ] && [ $i -lt 20 ]; do sleep 0.1; i=$((i+1)); done
+echo "gpu: $(ls /dev/dri/ 2>/dev/null | tr '\n' ' ')"
+mkdir -p /storage/games-external /storage/roms 2>/dev/null
+mountpoint -q /storage/games-external || mount -o noatime /dev/mmcblk0p3 /storage/games-external
+mountpoint -q /storage/roms || mount -o noatime /dev/mmcblk0p3 /storage/roms 2>/dev/null
+if ! mountpoint -q /storage/games-external; then
+    echo "FATAL: ROMS partition failed to mount"; sync
+    while :; do
+        echo 0 > /sys/class/backlight/backlight/bl_power; sleep 1
+        echo 4 > /sys/class/backlight/backlight/bl_power; sleep 1
+    done
+fi
+
+# ── restore clock (no battery-backed RTC) ───────────────────────────────────
+DT=/storage/games-external/.userdata/shared/datetime.txt
+[ -f "$DT" ] && date -s "$(cat "$DT")" >/dev/null 2>&1
+
+# ── audio: unmute the rk817 codec path ──────────────────────────────────────
+amixer -c 0 sset 'Speaker' on >/dev/null 2>&1
+amixer -c 0 sset 'Headphone' on >/dev/null 2>&1
+# open the softvol pcm once so ALSA materializes the 'MinUI' volume control
+aplay -D minui -f S16_LE -r 22050 -c 2 -d 1 /dev/zero >/dev/null 2>&1 &
+sleep 0.3
+amixer -c 0 sset 'MinUI' 80% unmute >/dev/null 2>&1
+
+# ── performance governor + backlight on ─────────────────────────────────────
+for g in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do
+    echo performance > "$g" 2>/dev/null
+done
+echo 0 > /sys/class/backlight/backlight/bl_power 2>/dev/null
+
+# ── mirror diagnostics to the visible SD partition ──────────────────────────
+cp /storage/fastboot.log /storage/games-external/fastboot.log 2>/dev/null
+dmesg | tail -n 150 > /storage/games-external/dmesg.txt 2>/dev/null
+amixer -c 0 scontrols > /storage/games-external/mixer.txt 2>&1
+echo '---' >> /storage/games-external/mixer.txt
+amixer -c 0 contents >> /storage/games-external/mixer.txt 2>&1
+
+# ── hand off to the launcher (SD-card copy wins so it stays updatable) ──────
+LAUNCH_SD=/storage/games-external/.system/gkdpixel2/paks/MinUI.pak/launch-fast.sh
+LAUNCH_RO=/usr/share/fastboot/launch-fast.sh
+echo "launching minui @ $(cat /proc/uptime | cut -d' ' -f1)s"
+if [ -f "$LAUNCH_SD" ]; then sh "$LAUNCH_SD"; else sh "$LAUNCH_RO"; fi
+
+# launcher returned → clean up and power off via direct reboot(2) syscall
+killall keymon.elf 2>/dev/null
+cp /storage/fastboot.log /storage/games-external/fastboot.log 2>/dev/null
+sync
+umount /storage/games-external 2>/dev/null || umount -l /storage/games-external 2>/dev/null
+umount /storage/roms 2>/dev/null
+if [ -f /tmp/reboot ]; then /usr/share/fastboot/pwr reboot; else /usr/share/fastboot/pwr off; fi
+# pwr only returns on failure — try the sysrq route, then reboot, then hold
+echo 1 > /proc/sys/kernel/sysrq 2>/dev/null
+echo o > /proc/sysrq-trigger; sleep 5
+/usr/share/fastboot/pwr reboot
+echo b > /proc/sysrq-trigger
+while :; do sleep 1000; done  # PID 1 must never exit
