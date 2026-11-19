@@ -16,9 +16,8 @@
 #define PRESSED		1
 #define REPEAT		2
 
-// L3 or R3
+// dedicated MENU button; matches platform.c (this device has no L3/R3)
 #define CODE_MENU 704 // BTN_TRIGGER_HAPPY1 (GKD Pixel 2)
-#define CODE_MENU_ALT 318 // 12 in SDL...
 
 #define CODE_PLUS 115
 #define CODE_MINUS 114
@@ -28,7 +27,9 @@
 #define BRIGHTNESS_MIN 	0
 #define BRIGHTNESS_MAX 	10
 
-#define INPUT_COUNT 6
+// event0 power, event1 volume, event2 buttons (+ spares). /dev/input/js0 was
+// read here too, but js_event isn't input_event, so every read was garbage.
+#define INPUT_COUNT 5
 static int inputs[INPUT_COUNT];
 static struct input_event ev;
 
@@ -36,25 +37,26 @@ static pthread_t ports_pt;
 #define JACK_STATE_PATH "/sys/bus/platform/devices/singleadc-joypad/hp"
 #define HDMI_STATE_PATH "/sys/class/extcon/hdmi/cable.0/state"
 
-int getInt(char* path) {
+static int getInt(char* path) {
 	int i = 0;
 	FILE *file = fopen(path, "r");
 	if (file!=NULL) {
-		fscanf(file, "%i", &i);
+		if (fscanf(file, "%i", &i)!=1) i = 0;
 		fclose(file);
 	}
 	return i;
 }
 
 static void* watchPorts(void *arg) {
+	(void)arg;
 	int has_headphones,had_headphones;
 	int has_hdmi,had_hdmi;
-	
+
+	// InitSettings() (called before this thread starts) already applied the
+	// current jack/hdmi state; only react to changes from here on
 	has_headphones = had_headphones = getInt(JACK_STATE_PATH);
 	has_hdmi = had_hdmi = getInt(HDMI_STATE_PATH);
-	SetJack(has_headphones);
-	SetHDMI(has_hdmi);
-	
+
 	while(1) {
 		sleep(1);
 		
@@ -75,18 +77,17 @@ static void* watchPorts(void *arg) {
 }
 
 
-int main (int argc, char *argv[]) {
+int main (void) {
 	printf("keymon\n"); fflush(stdout);
 	InitSettings();
 	pthread_create(&ports_pt, NULL, &watchPorts, NULL);
-	
+
 	char path[32];
-	for (int i=0; i<INPUT_COUNT-1; i++) {
-		sprintf(path, "/dev/input/event%i", i);
+	for (int i=0; i<INPUT_COUNT; i++) {
+		snprintf(path, sizeof(path), "/dev/input/event%i", i);
 		inputs[i] = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
 	}
-	inputs[5] = open("/dev/input/js0", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-	
+
 	uint32_t input;
 	uint32_t val;
 	uint32_t menu_pressed = 0;
@@ -122,7 +123,6 @@ int main (int argc, char *argv[]) {
 				// printf("value: %i code: %i\n", val, ev.code); fflush(stdout);
 				switch (ev.code) {
 					case CODE_MENU:
-					case CODE_MENU_ALT:
 						menu_pressed = val;
 					break;
 					case CODE_PLUS:

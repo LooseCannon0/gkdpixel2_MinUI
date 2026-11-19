@@ -12,16 +12,13 @@ TARGET=msettings
 
 CC = $(CROSS_COMPILE)gcc
 
-SYSROOT     := $(shell $(CC) --print-sysroot)
-
-INCLUDEDIR = $(SYSROOT)/usr/include
-CFLAGS = -I$(INCLUDEDIR)
+# warning-clean at -O2 with _FORTIFY_SOURCE (Ubuntu's gcc enables it whenever
+# optimizing), so -Werror is safe here
+CFLAGS = -O2 -Wall -Werror -fpic
 LDFLAGS = -ldl -lrt -s
 
-OPTM=-Ofast
-
-build: 
-	$(CC) -c -Werror -fpic "$(TARGET).c" -Wl,--no-as-needed $(LDFLAGS)
+build:
+	$(CC) -c $(CFLAGS) "$(TARGET).c"
 	$(CC) -shared -o "lib$(TARGET).so" "$(TARGET).o" $(LDFLAGS)
 	cp "$(TARGET).h" "$(PREFIX)/include"
 	cp "lib$(TARGET).so" "$(PREFIX)/lib"

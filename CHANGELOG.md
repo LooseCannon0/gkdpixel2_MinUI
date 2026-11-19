@@ -1,5 +1,60 @@
 # Changelog
 
+## v0.7
+Fixes from a full review.
+
+Boot and power
+- PID 1 can no longer exit: the log redirect is probed before `exec` (a failed
+  `exec >>` killed the shell, i.e. a kernel panic, e.g. when /storage didn't
+  mount), and rescue mode only execs `systemd.real` if it's there.
+- Backlight is switched on before the splash and the first-boot install; the
+  panel can come up powered down, which left both on a dark screen.
+- About 0.3 s off the boot path: no fixed `sleep 0.3` before audio setup, and
+  the diagnostics dump runs in the background. The softvol pcm is opened with
+  empty input, so it never holds the device when a game auto-resumes.
+- Shutdown waits for keymon before unmounting (it used to fall back to a lazy
+  unmount) and remounts /storage read-only before powering off.
+- The launcher gives up after 5 failed `minui.elf` starts instead of
+  restarting it forever; fastboot.log, minui.txt and keymon.txt are rotated
+  at 256 KB.
+
+Audio
+- The fast-mode ALSA config is applied at runtime (`/run/asound.conf`) instead
+  of replacing `/etc/asound.conf`, so rescue mode keeps PipeWire's routing.
+  It now also points the default pcm at the `minui` softvol, so programs that
+  open "default" (mpv in the Music pak) get sound.
+- Volume keys work in rescue mode again: libmsettings drives the softvol only
+  when `MINUI_FASTBOOT=1` (set by launch-fast.sh), else PipeWire's `Master`.
+- `SetVolume` clamps to 0–20, and stored settings are validated on load; an
+  out-of-range volume reached ALSA as e.g. 5000%.
+- libmsettings: one `amixer` call per change (init went from 6 to 2), settings
+  saved only when they change, with `fsync` of that file instead of a global
+  `sync`, and no crash if shared memory is unavailable.
+
+MinUI platform
+- Rotation: `rotation.txt` is validated (0/90/180/270; BOM/CRLF tolerated);
+  an empty or bad value no longer silently disables autodetection, and a
+  failed rotation texture falls back to unrotated output instead of black.
+- No more uninitialized reads when `wlan0` or the DT model is missing (could
+  show a phantom WiFi icon); About shows the full model name.
+- RK3326 CPU frequencies instead of rgb30's; L3/R3 no longer aliased to MENU
+  (keymon matches); keymon no longer misreads `/dev/input/js0`.
+
+Build
+- assemble.sh: never modifies the extracted squashfs dir, checks all inputs
+  up front, cleans up on failure, packages the Clock and Input tools (no RTC
+  in fast mode), un-pins the base port's Files/Music paks from Wayland, and
+  writes a root-owned minui.tar.
+- assemble.sh repacks SYSTEM with `-no-xattrs` (stock has none), so a build
+  host's SELinux labels no longer end up in the image.
+- make-splash.py finds its font on Fedora/Arch too (or `SPLASH_FONT`).
+- libmsettings builds at -O2 and warning-clean under `-Wall -Werror`.
+- `makefile.env` makes implicit function declarations an error, and the
+  README says to use a real Linux/aarch64 `SDL_config.h`: SDL's generic one is
+  libc-less on Linux, which made MinUI's string functions implicit
+  (pointer-truncating on aarch64) and broke the `say` build.
+- Stale comments and docs corrected.
+
 ## v0.6
 - Fixed: the first-boot fallback reboot used sysrq, which this kernel doesn't
   have — if the installer ever returned, the device would have fallen through

@@ -1,5 +1,5 @@
 $(PLATFORM):
 	# $@
-	cp ./workspace/$@/show/show.elf ./build/SYSTEM/$@/bin
-	# sdl12-compat (Wayland backend)
-	cp ./workspace/$@/other/sdl12-compat/build/libSDL-1.2.so.1.2.69 ./build/SYSTEM/$@/lib/libSDL-1.2.so.0
+	# Nothing extra to copy. This port is built per component and packaged by
+	# fastboot/assemble.sh (see README "Building the binaries"); the base port's
+	# show.elf and sdl12-compat aren't part of this repo.

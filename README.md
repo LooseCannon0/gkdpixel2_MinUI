@@ -34,15 +34,19 @@ fastboot/
   fastinit         PID-1 init script (installed as /usr/lib/systemd/systemd
                    inside the SYSTEM squashfs; the initramfs execs it directly)
   launch-fast.sh   MinUI launcher: kmsdrm + alsa-softvol env, game loop, splash
-  asound.conf      reconnects ALSA defaults and defines the 'minui' softvol pcm
-                   (the codec exposes no hardware volume control at all)
+  asound.conf      fast-mode ALSA config: default pcm/ctl on the codec plus the
+                   'minui' softvol pcm (the codec has no hardware volume
+                   control). fastinit applies it at runtime via
+                   /run/asound.conf, so rescue mode keeps PipeWire's routing
   pwr.c            ~20-line reboot(2) tool; this kernel has no sysrq and its
                    busybox has no poweroff applet, so PID 1 needs this
   loading.raw      480x640 XRGB8888 pre-rotated "LOADING..." framebuffer image
   make-splash.py   regenerates loading.raw / custom splashes
+  tools/           launch.sh for the Clock and Input tool paks
   assemble.sh      builds the flashable image: repacks the SYSTEM squashfs,
-                   swaps rebuilt binaries + launch-fast.sh into minui.tar, and
-                   writes both into the base image's FAT partition via mtools
+                   swaps rebuilt binaries + launch-fast.sh into minui.tar, adds
+                   the Clock/Input tools, and writes both into the base image's
+                   FAT partition via mtools
 minui/gkdpixel2/   MinUI platform layer for this device (drop into MinUI's
                    workspace/ as workspace/gkdpixel2):
   platform/        platform.c/.h — based on NukeBomB3000's port, plus a
@@ -62,19 +66,30 @@ patches/
 ## Building the binaries
 
 Cross-compiled on Ubuntu 24.04 with `gcc-aarch64-linux-gnu`, linked against the
-device's own libraries (extract the SYSTEM squashfs from the base image with
-`unsquashfs`) so ABI compatibility is guaranteed:
+device's own SDL and other libraries (extract the SYSTEM squashfs from the base
+image with `unsquashfs`). glibc symbol versions still come from the cross
+toolchain's own libc, so build on a distro whose glibc is no newer than the
+device's (24.04's 2.39 is fine); a newer one can produce binaries that fail to
+load with "GLIBC_2.xx not found".
 
 1. Clone shauninman/MinUI, apply `patches/minui-api-aarch64-guard.patch`, copy
    `minui/gkdpixel2/` in as `workspace/gkdpixel2/`.
 2. Fetch matching SDL headers (device ships SDL 2.30.9, SDL_ttf 2.20.2,
    SDL_image 2.8.2) and point `platform/makefile.env`'s include/lib paths at
-   them plus a symlink farm over the extracted squashfs's `/usr/lib`.
+   them plus a symlink farm over the extracted squashfs's `/usr/lib`. Replace
+   the source tree's generic `SDL_config.h` with a real Linux/aarch64 one
+   (e.g. `aarch64-linux-gnu/SDL2/_real_SDL_config.h` from Ubuntu's
+   `libsdl2-dev:arm64`): the generic one falls back to a minimal, libc-less
+   config on Linux, and MinUI relies on SDL for `<string.h>`/`<stdlib.h>`.
+   `makefile.env` turns implicit function declarations into errors so this
+   can't slip through.
 3. `make PLATFORM=gkdpixel2 CROSS_COMPILE=aarch64-linux-gnu- PREFIX=...` in
    `workspace/gkdpixel2/libmsettings`, then in `workspace/all/{minui,minarch,
    say,syncsettings,clock,minput}` and `workspace/gkdpixel2/keymon`.
 4. `aarch64-linux-gnu-gcc -O2 -s fastboot/pwr.c -o fastboot/pwr`
 5. `fastboot/assemble.sh <base-1.0.1.img> <extracted-squashfs-dir> <out.img>`
+   (checks every input up front; the squashfs dir is copied, never modified,
+   so it needs roughly that much free space next to `<out.img>`)
 
 Binaries can be sanity-checked without hardware via qemu-user against the
 extracted squashfs (`qemu-aarch64 <fs>/usr/lib/ld-linux-aarch64.so.1
@@ -83,15 +98,25 @@ extracted squashfs (`qemu-aarch64 <fs>/usr/lib/ld-linux-aarch64.so.1
 ## Runtime notes
 
 - **Rescue mode:** an empty `rescue.txt` on the FAT partition boots the
-  original stock stack (fastinit execs the preserved `systemd.real`).
+  original stock stack (fastinit execs the preserved `systemd.real`). It runs
+  the same MinUI binaries; libmsettings sees no `MINUI_FASTBOOT` there and
+  drives PipeWire's `Master` volume as the base port did.
 - **Rotation override:** `rotation.txt` on the FAT partition containing
-  0/90/180/270.
+  0/90/180/270 (whitespace, CRLF and a UTF-8 BOM are fine; anything else is
+  logged and ignored in favour of autodetection).
 - **Custom boot splash:** drop a `splash.raw` on the FAT partition (generate
   with `make-splash.py`).
 - **Diagnostics:** fastinit mirrors `fastboot.log`, a dmesg tail, and the ALSA
-  control list (`mixer.txt`) to the ROMS partition every boot.
-- Shutdown unmounts the SD partitions and powers off via `pwr`; PID 1 is
-  guarded against ever exiting (kernel panic otherwise).
+  control list (`mixer.txt`) to the ROMS partition every boot, in the
+  background. `fastboot.log`, `minui.txt` and `keymon.txt` are rotated at
+  256 KB (one `.old` kept).
+- **Clock:** there's no RTC; time is restored from `datetime.txt` at boot and
+  can be set with the Clock tool.
+- If `minui.elf` fails to start 5 times in a row, the launcher gives up and
+  the device powers off instead of looping; the reason is in `minui.txt`.
+- Shutdown waits for keymon to exit, unmounts the SD partitions, remounts
+  `/storage` read-only and powers off via `pwr`; PID 1 is guarded against ever
+  exiting (kernel panic otherwise).
 - WiFi/Bluetooth services are not started in fast mode by design.
 
 ## Known limitations
@@ -104,3 +129,7 @@ extracted squashfs (`qemu-aarch64 <fs>/usr/lib/ld-linux-aarch64.so.1
 - The SYSTEM squashfs still carries the full stock userland (~415 MB) as a
   library donor and rescue base; it could be stripped much smaller.
 - The pre-U-Boot logo and the initramfs bootsplash are untouched.
+- The base image's Files (DinguxCommander) and Music (mpv) paks aren't
+  rotation-aware. assemble.sh un-pins them from Wayland and fast mode gives
+  them working audio, so they start and play, but they draw sideways on the
+  portrait panel.

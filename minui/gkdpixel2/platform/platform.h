@@ -1,4 +1,5 @@
-// gkdpixel2 (RK3326S, 640x480, ROCKNIX/Wayland)
+// gkdpixel2 (RK3326S, ROCKNIX) — fast boot: SDL2 kmsdrm on a 480x640 portrait
+// panel; MinUI renders 640x480 and platform.c presents it rotated
 
 #ifndef PLATFORM_H
 #define PLATFORM_H

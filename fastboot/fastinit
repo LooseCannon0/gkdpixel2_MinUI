@@ -8,6 +8,10 @@
 #
 # Escape hatch: create a file named  rescue.txt  on the EMUELEC (FAT) partition
 # to boot the original full stock stack (systemd + Sway + wayland MinUI).
+#
+# PID 1 must never exit: that's a kernel panic. `exec` is a POSIX special
+# builtin, so if it fails (missing binary, or a redirection that can't be
+# opened) the shell exits — every exec below is guarded against that.
 # ─────────────────────────────────────────────────────────────────────────────
 export PATH=/usr/bin:/usr/sbin:/bin:/sbin
 
@@ -22,18 +26,42 @@ mountpoint -q /tmp  || mount -t tmpfs tmpfs /tmp
 mountpoint -q /run  || mount -t tmpfs tmpfs /run
 
 # ── rescue hatch: full stock boot ───────────────────────────────────────────
-if [ -f /flash/rescue.txt ]; then
+if [ -f /flash/rescue.txt ] && [ -x /usr/lib/systemd/systemd.real ]; then
     exec /usr/lib/systemd/systemd.real
 fi
 
-# ── optional boot splash (off by default; drop splash.raw on the FAT to use) ─
-[ -f /flash/splash.raw ] && cat /flash/splash.raw > /dev/fb0 2>/dev/null
+# ── backlight on, then the optional boot splash ─────────────────────────────
+# The panel can come up powered down (bl_power=4 survives a restart, and MinUI
+# writes 4 at every power-off). Turn it on before drawing anything, or the
+# splash and the ~30 s first-boot install happen on a dark screen.
+echo 0 > /sys/class/backlight/backlight/bl_power 2>/dev/null
+# off by default; drop splash.raw on the FAT to use
+[ -f /flash/splash.raw ] && cat /flash/splash.raw 2>/dev/null > /dev/fb0
 
 # ── logging to the rw storage partition ─────────────────────────────────────
+# log_to FILE...: send all further output to the first FILE that can be
+# opened. Each is probed in a subshell first, since a failed `exec >>` would
+# take PID 1 down with it.
+log_to() {
+    for f in "$@"; do
+        if ( : >> "$f" ) 2>/dev/null; then
+            exec >> "$f" 2>&1
+            LOG=$f
+            return 0
+        fi
+    done
+    return 1
+}
+# trim_log FILE: keep a log bounded across boots (one generation kept as .old)
+trim_log() {
+    [ -f "$1" ] && [ "$(wc -c < "$1")" -gt 262144 ] && mv -f "$1" "$1.old"
+}
 mountpoint -q /storage || mount /dev/mmcblk0p2 /storage 2>/dev/null
-LOG=/storage/fastboot.log
-exec >> "$LOG" 2>&1
-echo "=== fastinit $(cat /proc/uptime | cut -d' ' -f1)s ==="
+trim_log /storage/fastboot.log 2>/dev/null
+log_to /storage/fastboot.log /tmp/fastboot.log /dev/null
+echo "=== fastinit $(cut -d' ' -f1 /proc/uptime)s ==="
+[ "$LOG" = /storage/fastboot.log ] || echo "warning: /storage not writable, logging to $LOG"
+[ -f /flash/rescue.txt ] && echo "rescue.txt present but systemd.real is missing; continuing fast boot"
 
 # ── first boot: create + format the ROMS partition, install MinUI ───────────
 if [ -f /flash/first_run.txt ]; then
@@ -72,39 +100,63 @@ fi
 DT=/storage/games-external/.userdata/shared/datetime.txt
 [ -f "$DT" ] && date -s "$(cat "$DT")" >/dev/null 2>&1
 
-# ── audio: unmute the rk817 codec path ──────────────────────────────────────
-amixer -c 0 sset 'Speaker' on >/dev/null 2>&1
-amixer -c 0 sset 'Headphone' on >/dev/null 2>&1
-# open the softvol pcm once so ALSA materializes the 'MinUI' volume control
-aplay -D minui -f S16_LE -r 22050 -c 2 -d 1 /dev/zero >/dev/null 2>&1 &
-sleep 0.3
-amixer -c 0 sset 'MinUI' 80% unmute >/dev/null 2>&1
+# ── audio routing ───────────────────────────────────────────────────────────
+# Fast-mode ALSA config ('minui' softvol pcm; default pcm + ctl on the codec),
+# applied at runtime only, so rescue mode keeps the stock PipeWire routing.
+# ROCKNIX's alsa.conf (a LibreELEC patch) loads /run/asound.conf after
+# /etc/asound.conf; for an alsa.conf without that, bind-mount over
+# /etc/asound.conf instead (assemble.sh makes sure that file exists then).
+if grep -q '/run/asound.conf' /usr/share/alsa/alsa.conf 2>/dev/null; then
+    cp /usr/share/fastboot/asound.conf /run/asound.conf
+else
+    mount -o bind /usr/share/fastboot/asound.conf /etc/asound.conf
+fi || echo "warning: fast-mode ALSA config not applied; expect no sound"
 
-# ── performance governor + backlight on ─────────────────────────────────────
+# ── background boot tasks (nothing on the boot path waits for these) ────────
+# 1. Open the softvol pcm once so ALSA creates its 'MinUI Volume' control.
+#    With empty input aplay opens the pcm (creating the control) and exits at
+#    once, so it never holds the device when an auto-resumed game opens audio.
+#    Nothing needs to wait for it: keymon, minui and minarch each re-apply the
+#    saved volume on start, and minarch opens audio before doing so (upstream
+#    order), so in-game volume is always right. The Speaker/Headphone
+#    switches are keymon's job (libmsettings SetJack).
+# 2. Mirror diagnostics to the visible SD partition.
+(
+    aplay -q -D minui -t raw -f S16_LE -r 48000 -c 2 /dev/null
+    cp "$LOG" /storage/games-external/fastboot.log
+    dmesg | tail -n 150 > /storage/games-external/dmesg.txt
+    { amixer -c 0 scontrols; echo '---'; amixer -c 0 contents; } > /storage/games-external/mixer.txt 2>&1
+) >/dev/null 2>&1 &
+BG_PID=$!
+
+# ── performance governor ────────────────────────────────────────────────────
 for g in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do
     echo performance > "$g" 2>/dev/null
 done
-echo 0 > /sys/class/backlight/backlight/bl_power 2>/dev/null
-
-# ── mirror diagnostics to the visible SD partition ──────────────────────────
-cp /storage/fastboot.log /storage/games-external/fastboot.log 2>/dev/null
-dmesg | tail -n 150 > /storage/games-external/dmesg.txt 2>/dev/null
-amixer -c 0 scontrols > /storage/games-external/mixer.txt 2>&1
-echo '---' >> /storage/games-external/mixer.txt
-amixer -c 0 contents >> /storage/games-external/mixer.txt 2>&1
 
 # ── hand off to the launcher (SD-card copy wins so it stays updatable) ──────
 LAUNCH_SD=/storage/games-external/.system/gkdpixel2/paks/MinUI.pak/launch-fast.sh
 LAUNCH_RO=/usr/share/fastboot/launch-fast.sh
-echo "launching minui @ $(cat /proc/uptime | cut -d' ' -f1)s"
+echo "launching minui @ $(cut -d' ' -f1 /proc/uptime)s"
 if [ -f "$LAUNCH_SD" ]; then sh "$LAUNCH_SD"; else sh "$LAUNCH_RO"; fi
 
-# launcher returned → clean up and power off via direct reboot(2) syscall
+# ── launcher returned → clean up and power off via direct reboot(2) syscall ─
 killall keymon.elf 2>/dev/null
-cp /storage/fastboot.log /storage/games-external/fastboot.log 2>/dev/null
+# killall doesn't wait, and a dying keymon still holds its log open on the SD
+# card; unmounting before it's gone falls back to a lazy unmount
+i=0
+while pidof keymon.elf >/dev/null 2>&1 && [ $i -lt 20 ]; do sleep 0.1; i=$((i+1)); done
+[ -n "$BG_PID" ] && wait "$BG_PID" 2>/dev/null
+cp "$LOG" /storage/games-external/fastboot.log 2>/dev/null
 sync
-umount /storage/games-external 2>/dev/null || umount -l /storage/games-external 2>/dev/null
+if ! umount /storage/games-external 2>/dev/null; then
+    echo "games-external busy at shutdown; lazy unmount"
+    umount -l /storage/games-external 2>/dev/null
+fi
 umount /storage/roms 2>/dev/null
+# stop logging to /storage so it can go read-only before power-off
+log_to /dev/kmsg /dev/null
+mount -o remount,ro /storage 2>/dev/null
 if [ -f /tmp/reboot ]; then /usr/share/fastboot/pwr reboot; else /usr/share/fastboot/pwr off; fi
 # pwr only returns on failure — try the sysrq route, then reboot, then hold
 echo 1 > /proc/sys/kernel/sysrq 2>/dev/null

@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <linux/fb.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -48,8 +49,9 @@
 #define RAW_RSY		3
 #define RAW_RSX		4
 
-#define RAW_MENU1	RAW_L3
-#define RAW_MENU2	RAW_R3
+// FASTBOOT: rgb30 aliased L3/R3 as extra MENU buttons, which made the BTN_L3/
+// BTN_R3 branches below unreachable. This device has a dedicated MENU (704)
+// and no stick buttons, so the aliases are gone (keymon matches: 704 only).
 
 #define INPUT_COUNT 4
 static int inputs[INPUT_COUNT];
@@ -123,8 +125,6 @@ void PLAT_pollInput(void) {
 				else if (code==RAW_START)	{ btn = BTN_START; 		id = BTN_ID_START; }
 				else if (code==RAW_SELECT)	{ btn = BTN_SELECT; 	id = BTN_ID_SELECT; }
 				else if (code==RAW_MENU)	{ btn = BTN_MENU; 		id = BTN_ID_MENU; }
-				else if (code==RAW_MENU1)	{ btn = BTN_MENU; 		id = BTN_ID_MENU; }
-				else if (code==RAW_MENU2)	{ btn = BTN_MENU; 		id = BTN_ID_MENU; }
 				else if (code==RAW_L1)		{ btn = BTN_L1; 		id = BTN_ID_L1; }
 				else if (code==RAW_L2)		{ btn = BTN_L2; 		id = BTN_ID_L2; }
 				else if (code==RAW_L3)		{ btn = BTN_L3; 		id = BTN_ID_L3; }
@@ -205,6 +205,27 @@ static struct VID_Context {
 static int device_width;
 static int device_height;
 static int device_pitch;
+
+// FASTBOOT: parse MINUI_ROTATION (from /flash/rotation.txt). Accepts exactly
+// 0/90/180/270, tolerating a UTF-8 BOM and surrounding whitespace/CRLF (files
+// written on Windows). Returns 0 for anything else so the caller autodetects —
+// a bare atoi() turned an empty or BOM-prefixed file into "rotation off".
+static int parseRotation(const char* s, int* out) {
+	if (!s) return 0;
+	const unsigned char* p = (const unsigned char*)s;
+	if (p[0]==0xEF && p[1]==0xBB && p[2]==0xBF) p += 3;
+	while (*p && isspace(*p)) p++;
+	if (!*p) return 0;
+	char* end;
+	long v = strtol((const char*)p, &end, 10);
+	if (end==(const char*)p) return 0;
+	while (*end && isspace((unsigned char)*end)) end++;
+	if (*end) return 0;
+	if (v!=0 && v!=90 && v!=180 && v!=270) return 0;
+	*out = (int)v;
+	return 1;
+}
+
 SDL_Surface* PLAT_initVideo(void) {
 	// LOG_info("PLAT_initVideo\n");
 	
@@ -316,13 +337,12 @@ SDL_Surface* PLAT_initVideo(void) {
 	device_pitch	= p;
 	
 	vid.sharpness = SHARPNESS_SOFT;
-	
-	// FASTBOOT: line-buffer stdout so logs survive hard resets
-	setvbuf(stdout, NULL, _IOLBF, 0);
+
 	// FASTBOOT: name the renderer — "opengles2" means GPU is live, "software" means trouble
+	// (LOG_info flushes stdout after every line, so these survive hard resets)
 	SDL_RendererInfo rinfo;
 	if (SDL_GetRendererInfo(vid.renderer, &rinfo)==0) LOG_info("renderer: %s\n", rinfo.name);
-	
+
 	// FASTBOOT: detect physical output; if portrait (kmsdrm on this panel), render
 	// everything into a landscape target texture and present it rotated.
 	vid.rotation = 0;
@@ -330,15 +350,28 @@ SDL_Surface* PLAT_initVideo(void) {
 	SDL_GetRendererOutputSize(vid.renderer, &vid.out_w, &vid.out_h);
 	if (vid.out_w<=0 || vid.out_h<=0) { vid.out_w = w; vid.out_h = h; } // FASTBOOT: dummy driver safety
 	LOG_info("renderer output: %ix%i\n", vid.out_w, vid.out_h);
+	int auto_rotation = vid.out_h > vid.out_w ? 270 : 0;
 	char* rot_env = getenv("MINUI_ROTATION");
-	if (rot_env) vid.rotation = atoi(rot_env);
-	else if (vid.out_h > vid.out_w) vid.rotation = 270;
+	if (!rot_env) vid.rotation = auto_rotation;
+	else if (!parseRotation(rot_env, &vid.rotation)) {
+		LOG_warn("ignoring MINUI_ROTATION=\"%s\" (want 0, 90, 180 or 270); autodetected %i\n", rot_env, auto_rotation);
+		vid.rotation = auto_rotation;
+	}
 	if (vid.rotation) {
 		vid.rotated = SDL_CreateTexture(vid.renderer, SDL_PIXELFORMAT_RGB565, SDL_TEXTUREACCESS_TARGET, w,h);
-		SDL_SetRenderTarget(vid.renderer, vid.rotated);
-		LOG_info("rotation enabled: %i\n", vid.rotation);
+		if (vid.rotated && SDL_SetRenderTarget(vid.renderer, vid.rotated)==0) {
+			LOG_info("rotation enabled: %i\n", vid.rotation);
+		}
+		else {
+			// unrotated output beats PLAT_present() clearing every frame to black
+			LOG_error("rotation %i unavailable (%s); presenting unrotated\n", vid.rotation, SDL_GetError());
+			if (vid.rotated) SDL_DestroyTexture(vid.rotated);
+			vid.rotated = NULL;
+			vid.rotation = 0;
+			SDL_SetRenderTarget(vid.renderer, NULL);
+		}
 	}
-	
+
 	return vid.screen;
 }
 
@@ -488,7 +521,7 @@ static void updateEffect(void) {
 	if (effect.type==EFFECT_NONE) return; // disabled
 	if (effect.type==effect.live_type && effect.scale==live_scale && effect.color==live_color) return; // already loaded
 	
-	char* effect_path;
+	char* effect_path = NULL;
 	int opacity = 128; // 1 - 1/2 = 50%
 	if (effect.type==EFFECT_LINE) {
 		if (effect.scale<3) {
@@ -542,6 +575,7 @@ static void updateEffect(void) {
 	}
 	
 	// LOG_info("effect: %s opacity: %i\n", effect_path, opacity);
+	if (!effect_path) return; // unknown effect type
 	SDL_Surface* tmp = IMG_Load(effect_path);
 	if (tmp) {
 		if (effect.type==EFFECT_GRID) {
@@ -716,7 +750,9 @@ void PLAT_getBatteryStatus(int* is_charging, int* charge) {
 	else           *charge =  10;
 	
 	// wifi status, just hooking into the regular PWR polling
-	char status[16];
+	// FASTBOOT: getFile() leaves the buffer untouched when the file is missing,
+	// and wlan0 usually doesn't exist in fast mode (no udev, no WiFi services)
+	char status[16] = "";
 	getFile("/sys/class/net/wlan0/operstate", status,16);
 	online = prefixMatch("up", status);
 }
@@ -743,12 +779,14 @@ void PLAT_powerOff(void) {
 
 #define GOVERNOR_PATH "/sys/devices/system/cpu/cpufreq/policy0/scaling_setspeed"
 void PLAT_setCPUSpeed(int speed) {
+	// FASTBOOT: RK3326 OPPs (rgb30's RK3566 table went up to 1.99 GHz). Only takes
+	// effect under the userspace governor; fastinit selects performance.
 	int freq = 0;
 	switch (speed) {
 		case CPU_SPEED_MENU: 		freq =  600000; break;
-		case CPU_SPEED_POWERSAVE:	freq = 1104000; break;
-		case CPU_SPEED_NORMAL: 		freq = 1608000; break;
-		case CPU_SPEED_PERFORMANCE: freq = 1992000; break;
+		case CPU_SPEED_POWERSAVE:	freq = 1008000; break;
+		case CPU_SPEED_NORMAL: 		freq = 1296000; break;
+		case CPU_SPEED_PERFORMANCE: freq = 1512000; break;
 	}
 	putInt(GOVERNOR_PATH, freq);
 }
@@ -763,13 +801,19 @@ int PLAT_pickSampleRate(int requested, int max) {
 
 static char model[256];
 char* PLAT_getModel(void) {
-	char buffer[256];
-	getFile("/proc/device-tree/model", buffer, 256);
-	
+	// FASTBOOT: rgb30 showed only the last word of the DT model ("Powkiddy RGB30"
+	// -> "RGB30"), which reduces a name like "... Pixel 2" to "2", and fell back to
+	// "RGB30". Show the whole name unless it's too wide for the About screen.
+	char buffer[256] = ""; // getFile() leaves it untouched if the file is missing
+	getFile("/proc/device-tree/model", buffer, sizeof(buffer));
+	int len = strlen(buffer);
+	while (len && isspace((unsigned char)buffer[len-1])) buffer[--len] = '\0';
+
 	char* tmp = strrchr(buffer, ' ');
-	if (tmp) strcpy(model, tmp+1);
-	else strcpy(model, "RGB30");
-	
+	if (!len) strcpy(model, "GKD Pixel 2");
+	else if (len<=24 || !tmp) strcpy(model, buffer);
+	else strcpy(model, tmp+1);
+
 	return model;
 }
 
